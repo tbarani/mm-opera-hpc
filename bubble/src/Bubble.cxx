@@ -153,6 +153,7 @@ struct TestParameters {
   int verbosity_level = 0;  ///< Output verbosity level
   mfem_mgis::real scale_factor_vp =
       0.9;  ///< Scale factor for principal stress threshold
+  int verification = 0; ///< Enable output of the eigenstresses at the qps for verification
 };
 
 /**
@@ -180,6 +181,8 @@ void fill_parameters(mfem::OptionsParser& args, TestParameters& p) {
                  "Scaling factor for the principal stress");
   args.AddOption(&p.testcase_name, "-n", "--name-case",
                  "Name of the testcase.");
+  args.AddOption(&p.verification, "-vo", "--verification-output",
+                 "Generate the output for the verification of the solver");
 
   args.Parse();
 
@@ -286,6 +289,88 @@ static void calculateAverageHydrostaticStress(
        << global_integral / global_volume << "\n";
   }
 }  // end of calculateAverageHydrostaticStress
+
+/**
+ * \brief Dump the values of the principal stress at each QP
+ *
+ * \tparam parallel Whether running in parallel mode
+ * \param os Output stream for results
+ * \param f Quadrature function containing the eigenstress
+ */
+template <bool parallel>
+static void printEigenstressAtQPs(
+    std::ostream& os,
+    const mfem_mgis::ImmutablePartialQuadratureFunctionView& f) {
+  const auto& s = f.getPartialQuadratureSpace();
+  const auto& fed = s.getFiniteElementDiscretization();
+  const auto& fespace = fed.getFiniteElementSpace<parallel>();
+  const auto m = s.getId();
+  
+  std::vector<mfem_mgis::real> locals_;
+  
+  // Loop over all elements in the mesh
+  for (mfem_mgis::size_type i = 0; i != fespace.GetNE(); ++i) {
+    // Skip elements not in this material
+    if (fespace.GetAttribute(i) != m) {
+      continue;
+    }
+    const auto& fe = *(fespace.GetFE(i));
+    auto& tr = *(fespace.GetElementTransformation(i));
+    const auto& ir = s.getIntegrationRule(fe, tr);
+    for (mfem_mgis::size_type g = 0; g != ir.GetNPoints(); ++g) {
+      const auto& ip = ir.IntPoint(g);
+      tr.SetIntPoint(&ip);
+      mfem::Vector coord;
+      tr.Transform(tr.GetIntPoint(), coord);
+      locals_.push_back(coord[0]); 
+      locals_.push_back(coord[1]);
+      locals_.push_back(coord[2]);
+      locals_.push_back(f.getIntegrationPointValue(i, g));
+    }
+  }
+
+  int locals_hit = locals_.size();
+  
+  int nprocs;
+  MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+  
+  std::vector<int> hits, disps;
+  if (mfem_mgis::getMPIrank() == 0) {
+    hits.resize(nprocs);
+    disps.resize(nprocs);
+  }
+
+  MPI_Gather(&locals_hit, 1, MPI_INT, 
+             mfem_mgis::getMPIrank() == 0 ? hits.data() : nullptr, 1, MPI_INT, 
+             0, MPI_COMM_WORLD);
+
+  int total_count = 0;
+  if (mfem_mgis::getMPIrank() == 0) {
+    for (int i = 0; i < nprocs; ++i) {
+      disps[i] = total_count;
+      total_count += hits[i];
+    }
+  }
+  
+  std::vector<mfem_mgis::real> all_data;
+  if (mfem_mgis::getMPIrank() == 0) {
+    all_data.resize(total_count);
+  }
+  
+  MPI_Gatherv(locals_.data(), locals_hit, MPI_DOUBLE,
+              mfem_mgis::getMPIrank() == 0 ? all_data.data() : nullptr,
+              mfem_mgis::getMPIrank() == 0 ? hits.data() : nullptr,
+              mfem_mgis::getMPIrank() == 0 ? disps.data() : nullptr,
+              MPI_DOUBLE, 0, MPI_COMM_WORLD);
+  
+  if (mfem_mgis::getMPIrank() == 0) {
+    for (int i = 0; i < total_count; i += 4) {
+      os << all_data[i] << "," << all_data[i+1] << "," 
+         << all_data[i+2] << "," << all_data[i+3] << "\n";
+    }
+    os.flush();
+  }
+}  // end of printEigenstressAtQPs
 
 /**
  * \brief Main program
@@ -515,6 +600,18 @@ int main(int argc, char** argv) {
     export_stress.execute(problem.getImplementation<true>(), 0,
                           1);
   }
+
+  if (p.verification){
+    std::ofstream stresses_at_qps;
+    std::string stresses_fname = "stresses_at_qps.txt";
+    stresses_at_qps.open(stresses_fname);
+    if (mfem_mgis::getMPIsize() > 1)
+      printEigenstressAtQPs<true>(stresses_at_qps, eig);
+    else
+      printEigenstressAtQPs<false>(stresses_at_qps, eig);
+
+    stresses_at_qps.close();
+    }
 
   // Clean up, close, and win
   outfile_sighydr.close();
